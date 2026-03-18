@@ -4,6 +4,9 @@ import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from ray._common.observability.autoscaler_event_utils import (
+    build_autoscaler_scheduling_update_rows,  # noqa: F401 - re-exported
+)
 from ray._private.event.event_logger import EventLoggerAdapter
 from ray.autoscaler.v2.utils import ResourceRequestUtil
 from ray.core.generated.autoscaler_pb2 import (
@@ -153,127 +156,112 @@ class AutoscalerEventLogger:
             List[ClusterResourceConstraint]
         ] = None,
     ) -> None:
-        # Log any launch events.
+        launch_actions = []
         if launch_requests:
             launch_type_count = defaultdict(int)
             for req in launch_requests:
                 launch_type_count[req.instance_type] += req.count
+            launch_actions = [
+                {"instance_type": instance_type, "count": count}
+                for instance_type, count in launch_type_count.items()
+            ]
 
-            for idx, (instance_type, count) in enumerate(launch_type_count.items()):
-                log_str = f"Adding {count} node(s) of type {instance_type}."
-                self._export_event_logger.info(f"{log_str}")
-                logger.info(f"{log_str}")
-
-        # Log any terminate events.
+        terminate_actions = []
         if terminate_requests:
             termination_by_causes_and_type = defaultdict(int)
             for req in terminate_requests:
                 termination_by_causes_and_type[(req.cause, req.instance_type)] += 1
+            terminate_actions = [
+                {
+                    "cause": cause,
+                    "instance_type": instance_type,
+                    "count": count,
+                }
+                for (
+                    cause,
+                    instance_type,
+                ), count in termination_by_causes_and_type.items()
+            ]
 
-            cause_reason_map = {
-                TerminationRequest.Cause.OUTDATED: "outdated",
-                TerminationRequest.Cause.MAX_NUM_NODES: "max number of worker nodes reached",  # noqa
-                TerminationRequest.Cause.MAX_NUM_NODE_PER_TYPE: "max number of worker nodes per type reached",  # noqa
-                TerminationRequest.Cause.IDLE: "idle",
-            }
-
-            for idx, ((cause, instance_type), count) in enumerate(
-                termination_by_causes_and_type.items()
-            ):
-                log_str = f"Removing {count} nodes of type {instance_type} ({cause_reason_map[cause]})."  # noqa
-                self._export_event_logger.info(f"{log_str}")
-                logger.info(f"{log_str}")
-
-        # Cluster shape changes.
-        if launch_requests or terminate_requests:
-            num_cpus = cluster_resources.get("CPU", 0)
-            log_str = f"Resized to {int(num_cpus)} CPUs"
-
-            if "GPU" in cluster_resources:
-                log_str += f", {int(cluster_resources['GPU'])} GPUs"
-            if "TPU" in cluster_resources:
-                log_str += f", {int(cluster_resources['TPU'])} TPUs"
-
-            self._export_event_logger.info(f"{log_str}.")
-            self._export_event_logger.debug(
-                f"Current cluster resources: {dict(cluster_resources)}."
-            )
-
-        # Log any infeasible requests.
+        infeasible_resource_dicts = []
         if infeasible_requests:
             requests_by_count = ResourceRequestUtil.group_by_count(infeasible_requests)
-            log_str = "No available node types can fulfill resource requests "
-            for idx, req_count in enumerate(requests_by_count):
-                resource_map = ResourceRequestUtil.to_resource_map(req_count.request)
-                log_str += f"{resource_map}*{req_count.count}"
-                if idx < len(requests_by_count) - 1:
-                    log_str += ", "
-
-                # Parse and log label selectors if present
+            for req_count in requests_by_count:
+                request_entry = {
+                    "resources": ResourceRequestUtil.to_resource_map(req_count.request),
+                    "count": req_count.count,
+                }
                 if req_count.request.label_selectors:
                     selector_strs = []
                     for selector in req_count.request.label_selectors:
                         for constraint in selector.label_constraints:
-                            op = LabelSelectorOperator.Name(constraint.operator)
-                            values = ",".join(constraint.label_values)
                             selector_strs.append(
-                                f"{constraint.label_key} {op} [{values}]"
+                                {
+                                    "label_key": constraint.label_key,
+                                    "operator": LabelSelectorOperator.Name(
+                                        constraint.operator
+                                    ),
+                                    "values": list(constraint.label_values),
+                                }
                             )
                     if selector_strs:
-                        log_str += (
-                            " with label selectors: [" + "; ".join(selector_strs) + "]"
-                        )
+                        request_entry["label_constraints"] = selector_strs
+                infeasible_resource_dicts.append(request_entry)
 
-            log_str += (
-                ". Add suitable node types to this cluster to resolve this issue."
-            )
-            self._export_event_logger.warning(log_str)
-
+        infeasible_gang_dicts = []
         if infeasible_gang_requests:
-            # Log for each placement group requests.
             for gang_request in infeasible_gang_requests:
-                log_str = (
-                    "No available node types can fulfill "
-                    "placement group requests (detail={details}): ".format(
-                        details=gang_request.details
-                    )
-                )
                 requests_by_count = ResourceRequestUtil.group_by_count(
                     gang_request.requests
                 )
-                for idx, req_count in enumerate(requests_by_count):
-                    resource_map = ResourceRequestUtil.to_resource_map(
-                        req_count.request
-                    )
-                    log_str += f"{resource_map}*{req_count.count}"
-                    if idx < len(requests_by_count) - 1:
-                        log_str += ", "
-
-                log_str += (
-                    ". Add suitable node types to this cluster to resolve this issue."
+                infeasible_gang_dicts.append(
+                    {
+                        "details": gang_request.details,
+                        "bundles": [
+                            {
+                                "resources": ResourceRequestUtil.to_resource_map(
+                                    req_count.request
+                                ),
+                                "count": req_count.count,
+                            }
+                            for req_count in requests_by_count
+                        ],
+                    }
                 )
-                self._export_event_logger.warning(log_str)
 
+        infeasible_constraint_dicts = []
         if infeasible_cluster_resource_constraints:
-            # We will only have max 1 cluster resource constraint for now since it's
-            # from `request_resources()` sdk, where the most recent call would override
-            # the previous one.
             for infeasible_constraint in infeasible_cluster_resource_constraints:
-                log_str = "No available node types can fulfill cluster constraint: "
-                for i, requests_by_count in enumerate(
-                    infeasible_constraint.resource_requests
-                ):
-                    resource_map = ResourceRequestUtil.to_resource_map(
-                        requests_by_count.request
-                    )
-                    log_str += f"{resource_map}*{requests_by_count.count}"
-                    if i < len(infeasible_constraint.resource_requests) - 1:
-                        log_str += ", "
-
-                log_str += (
-                    ". Add suitable node types to this cluster to resolve this issue."
+                infeasible_constraint_dicts.append(
+                    {
+                        "resource_requests": [
+                            {
+                                "request": ResourceRequestUtil.to_resource_map(
+                                    requests_by_count.request
+                                ),
+                                "count": requests_by_count.count,
+                            }
+                            for requests_by_count in infeasible_constraint.resource_requests
+                        ]
+                    }
                 )
-                self._export_event_logger.warning(log_str)
+
+        for row in build_autoscaler_scheduling_update_rows(
+            cluster_resources=cluster_resources,
+            launch_actions=launch_actions,
+            terminate_actions=terminate_actions,
+            infeasible_resource_requests=infeasible_resource_dicts,
+            infeasible_gang_resource_requests=infeasible_gang_dicts,
+            infeasible_cluster_resource_constraints=infeasible_constraint_dicts,
+        ):
+            if row["severity"] == "WARNING":
+                self._export_event_logger.warning(row["message"])
+            elif row["severity"] == "DEBUG":
+                self._export_event_logger.debug(row["message"])
+            else:
+                self._export_event_logger.info(row["message"])
+                if row.get("log_to_logger"):
+                    logger.info(row["message"])
 
     # ------------------------------------------------------------------
     # ONE-event structured emission
