@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 def test_log_scheduling_updates():
     mock_logger = MockEventLogger(logger)
-    event_logger = AutoscalerEventLogger(mock_logger)
+    event_logger = AutoscalerEventLogger(export_event_logger=mock_logger)
 
     launch_requests = [
         launch_request("m4.large", 2),
@@ -106,22 +106,36 @@ def test_log_scheduling_updates():
     ]
 
 
-def test_log_scheduling_updates_without_cluster_shape():
-    mock_logger = MockEventLogger(logger)
-    event_logger = AutoscalerEventLogger(mock_logger, log_cluster_shape=False)
+def test_log_scheduling_updates_publishes_ray_events(monkeypatch):
+    published_events = []
+    sentinel_event = object()
 
-    event_logger.log_cluster_scheduling_update(
-        launch_requests=[launch_request("m4.large", 1)],
-        terminate_requests=[termination_request("m4.xlarge", OUTDATED)],
-        infeasible_requests=[ResourceRequestUtil.make({"CPU": 4})],
-        cluster_resources={"CPU": 5},
+    class _Publisher:
+        def publish(self, event):
+            published_events.append(event)
+
+    class _Builder:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def build(self):
+            return sentinel_event
+
+    monkeypatch.setattr(
+        "ray._common.observability.autoscaler_events.AutoscalerScalingDecisionEventBuilder",
+        _Builder,
     )
 
-    assert mock_logger.get_logs("info") == []
-    assert mock_logger.get_logs("warning") == [
-        "No available node types can fulfill resource requests {'CPU': 4.0}*1. Add suitable node types to this cluster to resolve this issue."
-    ]
-    assert mock_logger.get_logs("debug") == []
+    event_logger = AutoscalerEventLogger(
+        ray_event_publisher=_Publisher(),
+        session_name="test-session",
+    )
+    event_logger.log_cluster_scheduling_update(
+        cluster_resources={"CPU": 5},
+        launch_requests=[launch_request("m4.large", 2)],
+    )
+
+    assert published_events == [sentinel_event]
 
 
 if __name__ == "__main__":
